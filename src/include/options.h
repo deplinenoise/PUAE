@@ -527,6 +527,7 @@ struct uae_prefs {
 
 extern int config_changed;
 extern void config_check_vsync (void);
+struct zfile;
 
 /* Contains the filename of .uaerc */
 extern TCHAR optionsfile[];

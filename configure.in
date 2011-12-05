@@ -823,7 +823,7 @@ fi
 
 
 if test $ac_cv_prog_gcc = yes; then
-  WARNING_CFLAGS="$WARNING_CFLAGS -Wall -Wno-unused -Wno-format -W -Wmissing-prototypes -Wstrict-prototypes"
+  WARNING_CFLAGS="$WARNING_CFLAGS -Wall -Wno-sign-compare -Wno-unused -Wno-format -W -Wmissing-prototypes -Wstrict-prototypes"
   OPTIMIZE_CFLAGS="$OPTIMIZE_CFLAGS -fomit-frame-pointer -ffast-math"
 fi
 

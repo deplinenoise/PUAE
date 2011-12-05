@@ -73,10 +73,12 @@ void debug_wgetpeek (uaecptr addr, uae_u32 v);
 void debug_bgetpeek (uaecptr addr, uae_u32 v);
 void debug_bputpeek (uaecptr addr, uae_u32 v);
 void debug_wputpeek (uaecptr addr, uae_u32 v);
-void debug_lputpeek (uaecptr addr, uae_u32 v);
+void debug_putlpeek (uaecptr addr, uae_u32 v);
 
 enum debugtest_item { DEBUGTEST_BLITTER, DEBUGTEST_KEYBOARD, DEBUGTEST_FLOPPY, DEBUGTEST_MAX };
 void debugtest (enum debugtest_item, const TCHAR *, ...);
+
+const char *debug_find_symbol(uaecptr addr, uae_u32 *offset);
 
 struct dma_rec
 {
@@ -113,6 +115,7 @@ extern void debug_draw_cycles (uae_u8 *buf, int bpp, int line, int width, int he
 
 #else
 
+STATIC_INLINE const char *debug_find_symbol(uaecptr addr, uae_u32 *offset) { return 0; }
 STATIC_INLINE void activate_debugger (void) { };
 
 #endif

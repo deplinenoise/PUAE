@@ -35,6 +35,19 @@
 #include "inputrecord.h"
 #include "sleep.h"
 
+static const char *map_addr(uaecptr addr) {
+	uae_u32 offset;
+	static char buf[256];
+	const char *name;
+	
+	name = debug_find_symbol(addr, &offset);
+	if (!name)
+		return "";
+
+	snprintf(buf, sizeof buf, " [%s + %d]", name, offset);
+	return buf;
+}
+
 #define f_out fprintf
 #define console_out printf
 #ifdef JIT
@@ -1264,7 +1277,7 @@ static uae_s32 ShowEA (void *f, uae_u16 opcode, int reg, amodes mode, wordsizes 
 			else
 				_stprintf (offtxt, "$%04x", disp16);
 			addr = m68k_areg (regs, reg) + disp16;
-			_stprintf (buffer, "(A%d, %s) == $%08lx", reg, offtxt, (unsigned long)addr);
+			_stprintf (buffer, "(A%d, %s) == $%08lx%s", reg, offtxt, (unsigned long)addr, map_addr(addr));
 		}
 		break;
 	case Ad8r:
@@ -1294,24 +1307,24 @@ static uae_s32 ShowEA (void *f, uae_u16 opcode, int reg, amodes mode, wordsizes 
 			if (dp & 4) base += dispreg;
 
 			addr = base + outer;
-			_stprintf (buffer, "(%s%c%d.%c*%d+%ld)+%ld == $%08lx", name,
+			_stprintf (buffer, "(%s%c%d.%c*%d+%ld)+%ld == $%08lx%s", name,
 				dp & 0x8000 ? 'A' : 'D', (int)r, dp & 0x800 ? 'L' : 'W',
 				1 << ((dp >> 9) & 3),
 				disp, outer,
-				(unsigned long)addr);
+				(unsigned long)addr, map_addr(addr));
 		} else {
 			addr = m68k_areg (regs, reg) + (uae_s32)((uae_s8)disp8) + dispreg;
-			_stprintf (buffer, "(A%d, %c%d.%c*%d, $%02x) == $%08lx", reg,
+			_stprintf (buffer, "(A%d, %c%d.%c*%d, $%02x) == $%08lx%s", reg,
 				dp & 0x8000 ? 'A' : 'D', (int)r, dp & 0x800 ? 'L' : 'W',
 				1 << ((dp >> 9) & 3), disp8,
-				(unsigned long)addr);
+				(unsigned long)addr, map_addr(addr));
 		}
 		break;
 	case PC16:
 		addr = m68k_getpc () + m68kpc_offset;
 		disp16 = get_iword_1 (m68kpc_offset); m68kpc_offset += 2;
 		addr += (uae_s16)disp16;
-		_stprintf (buffer, "(PC,$%04x) == $%08lx", disp16 & 0xffff, (unsigned long)addr);
+		_stprintf (buffer, "(PC,$%04x) == $%08lx%s", disp16 & 0xffff, (unsigned long)addr, map_addr(addr));
 		break;
 	case PC8r:
 		addr = m68k_getpc () + m68kpc_offset;
@@ -1341,26 +1354,28 @@ static uae_s32 ShowEA (void *f, uae_u16 opcode, int reg, amodes mode, wordsizes 
 			if (dp & 4) base += dispreg;
 
 			addr = base + outer;
-			_stprintf (buffer, "(%s%c%d.%c*%d+%ld)+%ld == $%08lx", name,
+			_stprintf (buffer, "(%s%c%d.%c*%d+%ld)+%ld == $%08lx%s", name,
 				dp & 0x8000 ? 'A' : 'D', (int)r, dp & 0x800 ? 'L' : 'W',
 				1 << ((dp >> 9) & 3),
 				disp, outer,
-				(unsigned long)addr);
+				(unsigned long)addr,
+				map_addr(addr));
 		} else {
 			addr += (uae_s32)((uae_s8)disp8) + dispreg;
-			_stprintf (buffer, "(PC, %c%d.%c*%d, $%02x) == $%08lx", dp & 0x8000 ? 'A' : 'D',
+			_stprintf (buffer, "(PC, %c%d.%c*%d, $%02x) == $%08lx%s", dp & 0x8000 ? 'A' : 'D',
 				(int)r, dp & 0x800 ? 'L' : 'W',  1 << ((dp >> 9) & 3),
-				disp8, (unsigned long)addr);
+				disp8, (unsigned long)addr,
+				map_addr(addr));
 		}
 		break;
 	case absw:
 		addr = (uae_s32)(uae_s16)get_iword_1 (m68kpc_offset);
-		_stprintf (buffer, "$%08lx", (unsigned long)addr);
+		_stprintf (buffer, "$%08lx%s", (unsigned long)addr, map_addr(addr));
 		m68kpc_offset += 2;
 		break;
 	case absl:
 		addr = get_ilong_1 (m68kpc_offset);
-		_stprintf (buffer, "$%08lx", (unsigned long)addr);
+		_stprintf (buffer, "$%08lx%s", (unsigned long)addr, map_addr(addr));
 		m68kpc_offset += 4;
 		break;
 	case imm:
@@ -4330,13 +4345,13 @@ void m68k_disasm_2 (TCHAR *buf, int bufsize, uaecptr addr, uaecptr *nextpc, int 
 			if (deaddr)
 				*deaddr = newpc;
 			if (cctrue (dp->cc))
-				buf = buf_out (buf, &bufsize, " == $%08lX (T)", newpc);
+				buf = buf_out (buf, &bufsize, " == $%08lX (T)%s", newpc, map_addr(newpc));
 			else
-				buf = buf_out (buf, &bufsize, " == $%08lX (F)", newpc);
+				buf = buf_out (buf, &bufsize, " == $%08lX (F)%s", newpc, map_addr(newpc));
 		} else if ((opcode & 0xff00) == 0x6100) { /* BSR */
 			if (deaddr)
 				*deaddr = newpc;
-			buf = buf_out (buf, &bufsize, " == $%08lX", newpc);
+			buf = buf_out (buf, &bufsize, " == $%08lX%s", newpc, map_addr(newpc));
 		}
 		buf = buf_out (buf, &bufsize, "\n");
 	}

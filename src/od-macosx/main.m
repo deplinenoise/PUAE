@@ -26,6 +26,7 @@
 #import "main.h"
 #import <sys/param.h> /* for MAXPATHLEN */
 #import <unistd.h>
+#include <signal.h>
 
 /* Use this flag to determine whether we use CPS (docking) or not */
 #define	SDL_USE_CPS	1
@@ -385,11 +386,41 @@ int main (int argc, char **argv)
 
     return 0;
 }
+/*
+ * Handle break signal
+ */
+
+#ifdef __cplusplus
+static RETSIGTYPE sigbrkhandler(...)
+#else
+static RETSIGTYPE sigbrkhandler (int foo)
+#endif
+{
+#ifdef DEBUGGER
+    activate_debugger ();
+#endif
+
+#if !defined(__unix) || defined(__NeXT__)
+    signal (SIGINT, sigbrkhandler);
+#endif
+}
 
 
 /* Dummy for now */
 void setup_brkhandler (void)
 {
+#if defined(__unix) && !defined(__NeXT__)
+    struct sigaction sa;
+    sa.sa_handler = sigbrkhandler;
+    sa.sa_flags = 0;
+#ifdef SA_RESTART
+    sa.sa_flags = SA_RESTART;
+#endif
+    sigemptyset (&sa.sa_mask);
+    sigaction (SIGINT, &sa, NULL);
+#else
+    signal (SIGINT, sigbrkhandler);
+#endif
 }
 
 

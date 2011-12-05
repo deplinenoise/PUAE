@@ -35,6 +35,12 @@
 #include "cpummu.h"
 #include "rommgr.h"
 #include "inputrecord.h"
+#include "misc.h"
+#include "compemu.h"
+
+extern void pause_sound (void);
+extern void resume_sound (void);
+extern bool check_prefs_changed_comp (void);
 
 int debugger_active;
 static uaecptr skipaddr_start, skipaddr_end;
@@ -71,6 +77,280 @@ static FILE *logfile;
 #define console_get( input, len ) fgets( input, len, stdin )
 #define console_out_f printf
 #endif
+
+/* Symbol support */
+
+enum {
+	DSYM_PAGESIZE = 128*1024,
+};
+
+struct dsym_section {
+	int index;
+	uaecptr start;
+	uae_u32 size;
+};
+
+struct dsym_symbol {
+	const char *name;
+	int name_len;
+	uae_u32 hash;
+	uaecptr addr;
+	uae_u32 size;
+	struct dsym_symbol *next;
+	struct dsym_section *section;
+};
+
+struct dsym_addr {
+	uaecptr start;
+	uaecptr end;
+	struct dsym_symbol *symbol;
+};
+
+struct dsym_mempage {
+	struct dsym_mempage *next;
+	char *cursor;
+	char *end;
+	char data[0];
+};
+
+static struct {
+	int count;
+	int tblsize;
+	struct dsym_symbol **h_by_name;
+	struct dsym_mempage *alloc_chain;
+	struct dsym_addr *addr_map;
+} dsym_data;
+
+static struct dsym_mempage *dsym_alloc_page(int size)
+{
+	struct dsym_mempage *p;
+	int alloc_size = DSYM_PAGESIZE;
+	if (size > alloc_size)
+		alloc_size = size;
+	p = malloc(sizeof(struct dsym_mempage) + alloc_size);
+	p->cursor = p->data;
+	p->end = ((char*) p) + alloc_size;
+	return p;
+}
+
+static void *dsym_alloc(int size)
+{
+	void* result;
+	struct dsym_mempage *page;
+
+	size = (size + 3) & ~3; /* align to four bytes, good enough */
+
+	page = dsym_data.alloc_chain;
+
+	if (!page || (page->end - page->cursor) < size) {
+		page = dsym_alloc_page(size);
+		page->next = dsym_data.alloc_chain;
+		dsym_data.alloc_chain = page;
+	}
+
+	result = page->cursor;
+	page->cursor += size;
+	return result;
+}
+
+static void dsym_clear(void)
+{
+	struct dsym_mempage *page, *next;
+	page = dsym_data.alloc_chain;
+	while (page) {
+		next = page->next;
+		free(page);
+		page = next;
+	}
+	memset(&dsym_data, 0, sizeof dsym_data);
+}
+
+static int dsym_cmp_addr(const void *lhs_, const void *rhs_)
+{
+	const struct dsym_addr *lhs = lhs_, *rhs = rhs_;
+	return lhs->start - rhs->start;
+}
+
+static void dsym_gen_addr_lookup(void)
+{
+	int i, count;
+	struct dsym_addr *table, *p;
+
+	assert(!dsym_data.addr_map);
+
+	table = p = dsym_alloc(sizeof(struct dsym_addr) * dsym_data.count);
+
+	for (i = 0, count = dsym_data.tblsize; i <count; ++i) {
+		struct dsym_symbol *chain = dsym_data.h_by_name[i];
+		while (chain) {
+			p->start = chain->addr;
+			p->end = 0;
+			p->symbol = chain;
+			p++;
+			chain = chain->next;
+		}
+	}
+
+	assert(p == table + dsym_data.count);
+
+	qsort(table, dsym_data.count, sizeof(struct dsym_addr), dsym_cmp_addr);
+
+	/* Compute symbol sizes as best we can now that everthing is sorted by
+	 * address. */
+	for (i = 0, count = dsym_data.count; i <count; ++i) {
+		struct dsym_addr *curr_addr = &table[i];
+		struct dsym_addr *next_addr = i < count - 1 ? &table[i+1] : NULL;
+
+		struct dsym_symbol *curr_sym = curr_addr->symbol;
+		struct dsym_symbol *next_sym = next_addr ? next_addr->symbol : NULL;
+
+		if (next_sym && next_sym->section == curr_sym->section) {
+			/* two neighbors in the same section */
+			curr_sym->size = next_sym->addr - curr_sym->addr;
+		} else {
+			/* last symbol in a section */
+			uae_u32 offset = curr_sym->addr - curr_sym->section->start;
+			curr_sym->size = curr_sym->section->size - offset;
+		}
+
+		/* Propagate size range to address structure for speedier lookups. */
+		curr_addr->end = curr_sym->addr + curr_sym->size;
+
+		/*
+		printf("%08x % 8d %d (%d) - %s\n",
+				curr_sym->addr,
+				curr_sym->size,
+				curr_sym->section->index,
+				curr_sym->section->size,
+				curr_sym->name);
+		*/
+	}
+
+	dsym_data.addr_map = table;
+
+#if 0 /* verify lookup works */
+	for (i = 0, count = dsym_data.count; i <count; ++i) {
+		uae_u32 size;
+		assert(debug_find_symbol(table[i].start, &size));
+	}
+#endif
+}
+
+static void dsym_reset(int size)
+{
+	dsym_clear();
+
+	if (size < 128)
+		size = 128;
+
+	dsym_data.tblsize = size;
+	dsym_data.h_by_name = dsym_alloc(sizeof(struct dsym_symbol *) * size);
+}
+
+static uae_u32 djb2_hash(const uae_u8 *str, int len)
+{
+	uae_u32 hash = 5381;
+	int c, i;
+
+	for (i = 0; i < len; ++i) {
+		c = *str++;
+		hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+	}
+
+	return hash;
+}
+
+static char *dsym_strdup(const char *name, int len)
+{
+	char *dest;
+	dest = dsym_alloc(len+1);
+	dest[len] = '\0';
+	return memcpy(dest, name, len);
+}
+
+static void dsym_add_symbol(const char *name, uaecptr addr, struct dsym_section *section)
+{
+	struct dsym_symbol *sym;
+	int name_len = strlen(name);
+	const char *name_copy = dsym_strdup(name, name_len);
+	uae_u32 hash, index;
+
+	assert(dsym_data.tblsize && "must call dsym_reset() first");
+
+	hash = djb2_hash((const uae_u8 *)name, name_len);
+	index = hash % dsym_data.tblsize;
+
+	sym = dsym_alloc(sizeof(struct dsym_symbol));
+	sym->name = name_copy;
+	sym->name_len = name_len;
+	sym->hash = hash;
+	sym->size = 0;
+	sym->addr = addr;
+	sym->next = dsym_data.h_by_name[index];
+	sym->section = section;
+	dsym_data.h_by_name[index] = sym;
+
+	dsym_data.count++;
+}
+
+static const struct dsym_symbol *dsym_lookup_by_name(const char *name, int len)
+{
+	const struct dsym_symbol *sym;
+	uae_u32 hash, index;
+
+	if (!dsym_data.tblsize)
+		return 0;
+
+	hash = djb2_hash((const uae_u8 *)name, len);
+	index = hash % dsym_data.tblsize;
+
+	sym = dsym_data.h_by_name[index];
+	while (sym) {
+		if (sym->hash == hash &&
+			sym->name_len == len &&
+			0 == memcmp(sym->name, name, len))
+			return sym;
+		sym = sym->next;
+	}
+
+	return NULL;
+}
+
+static const struct dsym_symbol *dsym_lookup_by_addr(uaecptr addr)
+{
+	const struct dsym_symbol *sym;
+	int lo, hi;
+
+	if (!dsym_data.count)
+		return NULL;
+
+	lo = 0;
+	hi = dsym_data.count - 1;
+
+	do {
+		int index = (lo + hi) / 2;
+		const struct dsym_addr *a = &dsym_data.addr_map[index];
+		if (addr >= a->start && addr < a->end) {
+			return a->symbol;
+		} else if (addr > a->start) {
+			lo = index + 1;
+		} else {
+			hi = index - 1;
+		}
+	} while (lo <= hi);
+
+	return NULL;
+}
+
+/* interface for disassembler */
+const char *debug_find_symbol(uaecptr addr, uae_u32 *offset)
+{
+	const struct dsym_symbol *sym = dsym_lookup_by_addr(addr);
+	if (!sym)
+		return NULL;
+	*offset = addr - sym->addr;
+	return sym->name;
+}
 
 void deactivate_debugger (void)
 {
@@ -139,6 +419,7 @@ static const TCHAR help[] = {
 	"  s \"<string>\"/<values> [<addr>] [<length>]\n"
 	"                        Search for string/bytes\n"
 	"  T or Tt               Show exec tasks and their PCs\n"
+	"  Ts <process addr>     Show memory segments of a process\n"
 	"  Td,Tl,Tr              Show devices, libraries or resources\n"
 #ifdef SAVESTATE
 	"  b                     Step to previous state capture position\n"
@@ -304,7 +585,6 @@ static uae_u32 readintx (TCHAR **c)
 	return val * (negative ? -1 : 1);
 }
 
-
 static int checkvaltype (TCHAR **c, uae_u32 *val)
 {
 	TCHAR nc;
@@ -330,6 +610,22 @@ static int checkvaltype (TCHAR **c, uae_u32 *val)
 		(*c)++;
 		*val = readbinx (c);
 		return 1;
+	}
+	if (nc == '&') {
+		const struct dsym_symbol *sym;
+		TCHAR *end;
+		(*c)++;
+		end = *c;
+		while (*end && !isspace(*end))
+			++end;
+
+		if (NULL != (sym = dsym_lookup_by_name(*c, (int) (end - *c)))) {
+			*val = sym->addr;
+			(*c) = end;
+			return 1;
+		}
+		else
+			--(*c);
 	}
 	if (nc >= 'A' && nc <= 'Z' && nc != 'A' && nc != 'D') {
 		if (readregx (c, val))
@@ -367,6 +663,7 @@ static uae_u32 readint (TCHAR **c)
 		return val;
 	return readintx (c);
 }
+
 static uae_u32 readhex (TCHAR **c)
 {
 	uae_u32 val;
@@ -374,6 +671,7 @@ static uae_u32 readhex (TCHAR **c)
 		return val;
 	return readhexx (c);
 }
+
 static uae_u32 readint_s (TCHAR **c, int *size)
 {
 	uae_u32 val = readint (c);
@@ -543,7 +841,7 @@ static uaecptr nextaddr2 (uaecptr addr, int *next)
 static uaecptr nextaddr (uaecptr addr, uaecptr last, uaecptr *end)
 {
 	uaecptr paddr = addr;
-	int next;
+	int next = 0;
 	if (last && 0) {
 		if (addr >= last)
 			return 0xffffffff;
@@ -563,7 +861,7 @@ static uaecptr nextaddr (uaecptr addr, uaecptr last, uaecptr *end)
 	return addr;
 }
 
-int safe_addr(uaecptr addr, int size)
+static int safe_addr(uaecptr addr, int size)
 {
 	addrbank *ab = &get_mem_bank (addr);
 	if (!ab)
@@ -626,7 +924,7 @@ static void dumpmem (uaecptr addr, uaecptr *nxmem, int lines)
 
 static void dump_custom_regs (int aga)
 {
-	unsigned int len, i, j, end;
+	int len, i, j, end;
 	uae_u8 *p1, *p2, *p3, *p4;
 
 	if (aga) {
@@ -2468,14 +2766,13 @@ static void print_task_info (uaecptr node)
 	console_out_f ("%08X: ", node);
 	s = ((char*)get_real_address (get_long (node + 10)));
 	console_out_f (process ? " PROCESS '%s'" : " TASK    '%s'\n", s);
-	xfree (s);
 	if (process) {
 		uaecptr cli = BPTR2APTR (get_long (node + 172));
 		int tasknum = get_long (node + 140);
 		if (cli && tasknum) {
 			uae_u8 *command_bstr = get_real_address (BPTR2APTR (get_long (cli + 16)));
 			//TCHAR *command = BSTR2CSTR (command_bstr);
-			console_out_f (" [%d, '%s']\n", tasknum, command_bstr);
+			console_out_f (" [%d, '%s']\n", tasknum, command_bstr+1);
 			//xfree (command);
 		} else {
 			console_out ("\n");
@@ -2509,6 +2806,136 @@ static void show_exec_tasks (void)
 	}
 }
 
+struct dos_segment {
+	uaecptr address;
+	uae_u32 size;
+};
+
+static int find_segments(uaecptr task_ptr, struct dos_segment segments[], int segmax)
+{
+	int i = 0;
+	uaecptr cli, seglist;
+
+	/* make sure this is a process */
+	if (get_byte (task_ptr + 8) != 13) {
+		console_out("task is not a process!\n");
+		return 0;
+	}
+
+	cli = BPTR2APTR(get_long(task_ptr + 172));
+
+	if (cli) {
+		/* started from CLI */
+		seglist = BPTR2APTR(get_long(cli + 60));
+	} else {
+		/* started from WB, seglist[2] is process seglist */
+		seglist = BPTR2APTR(get_long(task_ptr + 128));
+		seglist = BPTR2APTR(get_long(seglist + 12));
+	}
+
+	while (seglist && i < segmax) {
+		segments[i].address = seglist;
+		segments[i].size = get_long(seglist-4);
+		seglist = BPTR2APTR(get_long(seglist));
+		++i;
+	}
+
+	return i;
+}
+
+static void show_segments(uaecptr task_ptr)
+{
+	struct dos_segment segs[32];
+	int i, segcount = find_segments(task_ptr, segs, 32);
+
+	for (i = 0; i < segcount; ++i) {
+		console_out_f("segment %d: %08x - %08x (%d bytes)\n",
+				i, segs[i].address, segs[i].address + segs[i].size,
+				segs[i].size);
+	}
+}
+
+static void load_symbols(uaecptr task_ptr, FILE *f)
+{
+	char line[512];
+	struct dos_segment segs[32];
+	int segcount = find_segments(task_ptr, segs, 32);
+	int segidx = -1;
+	struct dsym_section *section = NULL;
+	uae_u32 sectsize = 0;
+
+	dsym_reset(79129);
+
+	console_out_f("%d segments in process.. matching against map file..\n", segcount);
+
+	while (fgets(line, sizeof line, f)) {
+
+		if (line[0] == ' ' && segidx >= 0) {
+			struct dsym_symbol *sym;
+			uae_u32 offset;
+			uaecptr address;
+			char *name, *sep;
+			name = line + 1;
+			if (NULL == (sep = strchr(name, ' '))) {
+				console_out("malformed map file\n");
+				goto error;
+			}
+			*sep = '\0';
+			if (1 != sscanf(sep + 1, "%u", &offset)) {
+				console_out("malformed map file\n");
+				goto error;
+			}
+
+			/* Compensate for OS padding of segments (size+next ptr overhead
+			 * for each segment). The size word is stored before the segment,
+			 * so segment data is only shifted 4 bytes by the next pointer. */
+			offset += 4;
+			if (offset >= segs[segidx].size) {
+				console_out_f("symbol size out of bounds: %s\n", line+1);
+				goto error;
+			}
+
+			address = segs[segidx].address + offset;
+
+			/* Keep track of lowest address seen in section. */
+			if (address < section->start)
+				section->start = address;
+
+			dsym_add_symbol(name, address, section);
+
+		} else if (1 == sscanf(line, "SECTION size=%u", &sectsize)) {
+			++segidx;
+
+			section = dsym_alloc(sizeof(struct dsym_section));
+			section->start = 0xffffffffu;
+			section->index = segidx;
+			section->size = sectsize;
+
+			if (segidx >= segcount) {
+				console_out("too many sections in map file\n");
+				goto error;
+			} else if (sectsize + 8 != segs[segidx].size) {
+				console_out_f("size mismatch for section %d: %u map-file vs %u in-core bytes\n",
+						segidx, sectsize, segs[segidx].size);
+			}
+			console_out("segment %d..\n", segidx);
+
+		} else {
+			console_out("malformed map file\n");
+			goto error;
+		}
+	}
+
+	console_out_f("building address->symbol map..\n");
+	dsym_gen_addr_lookup();
+
+	console_out_f("%d symbols loaded\n", dsym_data.count);
+	return;
+
+error:
+	dsym_clear();
+}
+
 static uaecptr get_base (const uae_char *name)
 {
 	uaecptr v = get_long (4);
@@ -2517,7 +2944,7 @@ static uaecptr get_base (const uae_char *name)
 	if (!b || !b->check (v, 400) || b->flags != ABFLAG_RAM)
 		return 0;
 	v += 378; // liblist
-	while (v = get_long (v)) {
+	while ((v = get_long (v))) {
 		uae_u32 v2;
 		uae_u8 *p;
 		b = &get_mem_bank (v);
@@ -2974,7 +3401,7 @@ static void debug_sprite (TCHAR **inptr)
 	int ypos, ypos_ecs;
 	int ypose, ypose_ecs;
 	int attach;
-	uae_u64 w1, w2, ww1, ww2;
+	uae_u64 w1, w2, ww1 = 0, ww2 = 0;
 	int size = 1, width;
 	int ecs, sh10;
 	int y, i;
@@ -3199,7 +3626,7 @@ static void m68k_modify (TCHAR **inptr)
 	if (c1 == 'A' && c2 < 8)
 		regs.regs[8 + c2] = v;
 	else if (c1 == 'D' && c2 < 8)
-		regs.regs[c2] = v;
+		regs.regs[c2&0xf] = v;
 	else if (c1 == 'P' && c2 == 0)
 		regs.irc = v;
 	else if (c1 == 'P' && c2 == 1)
@@ -3332,6 +3759,14 @@ static bool debug_line (TCHAR *input)
 		case 'T':
 			if (inptr[0] == 't' || inptr[0] == 0)
 				show_exec_tasks ();
+			else if (inptr[0] == 's') {
+				if (more_params(&inptr)) {
+					uae_u32 addr = readhex(&inptr);
+					show_segments(addr);
+				}
+				else
+					console_out("specify a process address\n");
+			}
 			else
 				show_exec_lists (inptr[0]);
 			break;
@@ -3555,6 +3990,63 @@ static bool debug_line (TCHAR *input)
 				console_out_f ("\n");
 			}
 			break;
+		case 'L':
+			{
+				char *fn, *cr;
+				FILE *f;
+				uae_u32 proc_id = 0;
+				if (1 != sscanf(inptr+1, "%08x", &proc_id)) {
+					console_out("specify a process address (list with Tt)\n");
+					break;
+				}
+
+				fn = inptr+10;
+
+				if (NULL != (cr = strchr(fn, '\n')))
+					*cr = '\0';
+
+				if (NULL == (f = fopen(fn, "r"))) {
+					console_out_f("can't open map file '%s'\n", fn);
+					break;
+				}
+				
+				load_symbols(proc_id, f);
+
+				fclose(f);
+				break;
+			}
+		case 'l':
+			{
+				if (inptr[0] == 's') { /* lookup symbol */
+					const struct dsym_symbol *sym;
+					char *name = &inptr[2];
+					char *end = name;
+					while (*end && !isspace(*end))
+						++end;
+					*end = '\0';
+
+					if (NULL != (sym = dsym_lookup_by_name(name, end - name)))
+						console_out_f("%08x\n", sym->addr);
+					else
+						console_out_f("unknown symbol '%s'\n", name);
+					break;
+				}
+				else if (inptr[0] == 'n') {
+					const struct dsym_symbol *sym;
+					++inptr;
+					if (more_params(&inptr)) {
+						uaecptr addr = readhex(&inptr);
+						if (NULL != (sym = dsym_lookup_by_addr(addr)))
+							console_out_f("%08x is inside %s [%08x - %08x, size: %u]\n",
+									addr, sym->name, sym->addr, sym->addr + sym->size, sym->size);
+						else
+							console_out_f("no symbol mapped for address %08x\n", addr);
+					} else {
+						console_out_f("please specify an address\n");
+					}
+					break;
+				}
+			}
 		case 'h':
 		case '?':
 			if (more_params (&inptr))
@@ -3583,7 +4075,10 @@ static void debug_1 (void)
 		console_out (">");
 		console_flush ();
 		debug_linecounter = 0;
-		v = console_get (input, MAX_LINEWIDTH);
+		input[0] = '\0';
+		if (!console_get (input, MAX_LINEWIDTH))
+			strcpy(input, "q\n");
+		v = strlen(input);
 		if (v < 0)
 			return;
 		if (v == 0)
@@ -3669,16 +4164,16 @@ void debug (void)
 						uaecptr cli = BPTR2APTR(get_long (activetask + 172));
 						uaecptr seglist = 0;
 
-						uae_char *command = NULL;
+						uae_u8 *command = NULL;
 						if (cli) {
 							if (processname)
-								command = (char*)get_real_address (BPTR2APTR(get_long (cli + 16)));
+								command = (uae_u8*)get_real_address (BPTR2APTR(get_long (cli + 16)));
 							seglist = BPTR2APTR(get_long (cli + 60));
 						} else {
 							seglist = BPTR2APTR(get_long (activetask + 128));
 							seglist = BPTR2APTR(get_long (seglist + 12));
 						}
-						if (activetask == processptr || (processname && (!strcasecmp (name, processname) || (command && command[0] && !strncasecmp (command + 1, processname, command[0]) && processname[command[0]] == 0)))) {
+						if (activetask == processptr || (processname && (!strcasecmp (name, processname) || (command && command[0] && !strncasecmp ((char*)command + 1, processname, command[0]) && processname[command[0]] == 0)))) {
 							while (seglist) {
 								uae_u32 size = get_long (seglist - 4) - 4;
 								if (pc >= (seglist + 4) && pc < (seglist + size)) {
